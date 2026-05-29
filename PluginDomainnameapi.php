@@ -6,7 +6,7 @@ require_once 'plugins/registrars/domainnameapi/api.php';
 
 class PluginDomainnameapi extends RegistrarPlugin
 {
-    public const MODULE_VERSION='1.0.7';
+    public const MODULE_VERSION='2.0.2';
     public $features = [
         'nameSuggest' => false,
         'importDomains' => true,
@@ -17,7 +17,7 @@ class PluginDomainnameapi extends RegistrarPlugin
     /**
      * @var DomainNameAPI_PHPLibrary
      */
-    private $api;
+    private  $api;
 
     public function setup()
     {
@@ -25,6 +25,7 @@ class PluginDomainnameapi extends RegistrarPlugin
             $this->settings->get('plugin_Domainnameapi_Username'),
             $this->settings->get('plugin_Domainnameapi_Password')
         );
+
     }
 
     public function getVariables()
@@ -101,6 +102,14 @@ class PluginDomainnameapi extends RegistrarPlugin
         $result = $this->api->CheckAvailability([$params['sld']], $tldList, '1', 'create');
         $this->logCall();
 
+        if (isset($result['result']) && $result['result'] == 'ERROR') {
+            $domains[] = [
+                'tld'    => $params['tld'],
+                'domain' => $params['sld'],
+                'status' => -2
+            ];
+            return ['result' => $domains];
+        }
 
         if (is_array($result)) {
             foreach ($result as $results) {
@@ -142,7 +151,7 @@ class PluginDomainnameapi extends RegistrarPlugin
         $userPackage = new UserPackage($params['userPackageId']);
         $orderid = $this->registerDomain($this->buildRegisterParams($userPackage, $params));
         $userPackage->setCustomField("Registrar Order Id", $userPackage->getCustomField("Registrar") . '-' . $orderid);
-        return $this->user->lang('{domain} has been registered.', ['domain' => $userPackage->getCustomField('Domain Name')]);
+        return $userPackage->getCustomField('Domain Name') . ' has been registered.';
     }
 
     /**
@@ -155,7 +164,7 @@ class PluginDomainnameapi extends RegistrarPlugin
         $userPackage = new UserPackage($params['userPackageId']);
         $orderid = $this->renewDomain($this->buildRenewParams($userPackage, $params));
         $userPackage->setCustomField("Registrar Order Id", $userPackage->getCustomField("Registrar") . '-' . $orderid);
-        return $this->user->lang('{domain} has been renewed.', ['domain' => $userPackage->getCustomField('Domain Name')]);
+        return $userPackage->getCustomField('Domain Name') . ' has been renewed.';
     }
 
     public function getTransferStatus($params)
@@ -210,10 +219,7 @@ class PluginDomainnameapi extends RegistrarPlugin
             $privacy = true;
         }
 
-        $result = $this->api->RegisterWithContactInfo(
-            $params['sld'] . '.' . $params['tld'],
-            $params['NumYears'],
-            [
+        $result = $this->api->RegisterWithContactInfo($params['sld'] . '.' . $params['tld'], $params['NumYears'], [
                 'Administrative' => $this->contactInfoToArray($params),
                 'Billing'        => $this->contactInfoToArray($params),
                 'Technical'      => $this->contactInfoToArray($params),
@@ -233,8 +239,8 @@ class PluginDomainnameapi extends RegistrarPlugin
     }
 
     private function contactInfoToArray($params, $set = false)
-    {
-        $contactInfo = [
+{
+    $contactInfo = [
         'FirstName'        => $params[$set ? 'Registrant_FirstName' : 'RegistrantFirstName'],
         'LastName'         => $params[$set ? 'Registrant_LastName' : 'RegistrantLastName'],
         'Company'          => $params[$set ? 'Registrant_OrganizationName' : 'RegistrantOrganizationName'],
@@ -249,14 +255,14 @@ class PluginDomainnameapi extends RegistrarPlugin
         'Type'             => 'Contact',
         'ZipCode'          => $params[$set ? 'Registrant_PostalCode' : 'RegistrantPostalCode'],
         'State'            => $params[$set ? 'Registrant_StateProvince' : 'RegistrantStateProvince'],
-        ];
+    ];
 
-        if (!$set) {
-            $contactInfo['Status'] = '';
-        }
-
-        return $contactInfo;
+    if (!$set) {
+        $contactInfo['Status'] = '';
     }
+
+    return $contactInfo;
+}
 
     private function validateCountryCode($country)
     {
@@ -350,6 +356,7 @@ class PluginDomainnameapi extends RegistrarPlugin
         $info = [];
 
         if ($result["result"] == "OK") {
+
             $nameservers = isset($result["data"]["NameServers"][0]) ? $result["data"]["NameServers"] : [];
 
             return array_values($nameservers);
@@ -379,7 +386,7 @@ class PluginDomainnameapi extends RegistrarPlugin
     {
         $this->setup();
         $domain = $params['sld'] . '.' . $params['tld'];
-        if (isset($params['domain'])) {
+        if(isset($params['domain'])){
             $domain = $params['domain'];
         }
         $result = $this->api->SyncFromRegistry($domain);
@@ -389,7 +396,7 @@ class PluginDomainnameapi extends RegistrarPlugin
             $data['domain'] = $result['data']['DomainName'];
             $data['expiration'] = $result['data']['Dates']['Expiration'];
             $data['is_registered'] = $result['data']['Status'] == 'ACTIVE';
-            $data['is_expired'] = strtotime($result['data']['Dates']['Expiration']) < time();
+            $data['is_expired'] = strtotime($result['data']['Dates']['Expiration'])>time();
             $data['registrationstatus'] = 'N/A';
             $data['purchasestatus'] = 'N/A';
             $data['is_locked'] = $result['data']['LockStatus']==='true';
@@ -421,7 +428,8 @@ class PluginDomainnameapi extends RegistrarPlugin
         $result = $this->api->GetList($getListArgs);
         if (is_array($result['data']['Domains'])) {
             foreach ($result['data']['Domains'] as $domain) {
-                $domainName = trim($domain['DomainName']);
+
+               $domainName = trim($domain['DomainName']);
                 $temp = explode('.', $domainName);
                 $sld = $temp[0];
                 unset($temp[0]);
@@ -509,7 +517,7 @@ class PluginDomainnameapi extends RegistrarPlugin
             $modifyResult = $this->api->ModifyPrivacyProtectionStatus($domain, true);
         }
 
-        if ($modifyResult['result'] != 'OK') {
+        if($modifyResult['result'] != 'OK'){
             throw new CE_Exception($modifyResult['error']['Message'] . "\n" . $modifyResult['error']['Details']);
         }
 
@@ -599,29 +607,33 @@ class PluginDomainnameapi extends RegistrarPlugin
         }
     }
 
-    public function getTLDsAndPrices($params)
-    {
-        $this->setup();
-        $tldlist = $this->api->GetTldList(1200);
-        $this->logCall();
+   public function getTLDsAndPrices($params)
+{
+    $this->setup();
+    $tldlist = $this->api->GetTldList(1200);
+    $this->logCall();
 
-        $tlds = [];
-        if ($tldlist['result'] == 'OK') {
-            foreach ($tldlist['data'] as $extension) {
-                if (strlen($extension['tld'])>1) {
-                      $price_registration = $extension['pricing']['registration']['1'];
-                      $price_renew        = $extension['pricing']['renew']['1'];
-                      $price_transfer     = $extension['pricing']['transfer']['1'];
-                      $current_currency   = $extension['currencies']['registration'];
+    $tlds = [];
+    if ($tldlist['result'] == 'OK') {
+        foreach ($tldlist['data'] as $extension) {
+            if(strlen($extension['tld'])>1){
+                $price_registration = $extension['pricing']['registration']['1'];
+                $price_renew        = $extension['pricing']['renew']['1'];
+                $price_transfer     = $extension['pricing']['transfer']['1'];
+                $current_currency   = $extension['currencies']['registration'];
 
-                      $tlds[$extension['tld']]['pricing']['register']=(float)$price_registration;
-                      $tlds[$extension['tld']]['pricing']['renew']=(float)$price_renew;
-                      $tlds[$extension['tld']]['pricing']['transfer']=(float)$price_transfer;
-                }
+                $tlds[$extension['tld']]['pricing']['register']=(float)$price_registration;
+                $tlds[$extension['tld']]['pricing']['renew']=(float)$price_renew;
+                $tlds[$extension['tld']]['pricing']['transfer']=(float)$price_transfer;
+
             }
-            return $tlds;
-        } else {
-             throw new CE_Exception($tldlist['error']['Message'] . "\n" . $tldlist['error']['Details']);
         }
+        return $tlds;
+    } else {
+        throw new CE_Exception($tldlist['error']['Message'] . "\n" . $tldlist['error']['Details']);
     }
+
+
+}
+
 }
