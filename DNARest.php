@@ -49,6 +49,39 @@ class DNARest
     public const URL_PROD = "https://api.domainresellerapi.com/api/v1";
     public const URL_OTE  = "https://ote.domainresellerapi.com/api/v1";
 
+    /**
+     * Gateway DomainStatus enum (byte) → textual label.
+     *
+     * The domain listing endpoint returns the numeric enum in `status` and the
+     * textual label in `statusCode`; some responses may still deliver the
+     * numeric value only. This map lets us recover the SOAP-style label that
+     * callers compare against (e.g. "Active"). Source: gateway DomainStatus enum.
+     */
+    private const DOMAIN_STATUS_MAP = [
+        0  => 'Active',
+        1  => 'WaitingForRegistration',
+        2  => 'WaitingForDocument',
+        3  => 'WaitingForIncomingTransfer',
+        4  => 'TransferredOut',
+        7  => 'PendingDelete',
+        8  => 'Deleted',
+        9  => 'ConfirmationEmailSend',
+        11 => 'WaitingForOutgoingTransfer',
+        12 => 'PendingHold',
+        15 => 'ModificationPending',
+        18 => 'InCase',
+        19 => 'PendingRestore',
+    ];
+
+    /**
+     * Gateway DomainRenewalMode enum (byte) → textual label.
+     */
+    private const DOMAIN_RENEWAL_MODE_MAP = [
+        1 => 'AutoRenew',
+        2 => 'AutoExpire',
+        3 => 'AutoDelete',
+    ];
+
     private string $serviceUrl          = self::URL_PROD;
     private string $application         = "CORE";
     public array   $lastRequest         = [];
@@ -279,7 +312,7 @@ class DNARest
         $headers = [
             'Content-Type: application/json',
             'Accept: application/json',
-            'X-API-KEY: ' . $this->token,  // Swagger'da X-API-KEY kullanılıyor
+            'X-API-KEY: ' . $this->token,  // Swagger uses X-API-KEY
             '__reseller: ' . $this->resellerId  // Zorunlu header
         ];
 
@@ -305,6 +338,7 @@ class DNARest
         if (curl_errno($ch)) {
             $error = new Exception('Curl error during request: ' . curl_error($ch));
             $this->sendErrorToSentryAsync($error);
+            curl_close($ch);
         } else {
             curl_close($ch);
 
@@ -312,21 +346,11 @@ class DNARest
             if ($response_status >= 200 && $response_status <= 299) {
                 $parsedResponse           = json_decode($response_body, true);
                 $this->lastParsedResponse = $parsedResponse;
-
-                if (method_exists($this, 'sendPerformanceMetricsToSentry')) {
-                    $duration = (microtime(true) - $this->startAt) * 1000;
-                    $this->sendPerformanceMetricsToSentry([
-                        'operation'       => $this->lastFunction,
-                        'duration'        => floatval($duration),
-                        'success'         => true,
-                        'timestamp'       => gmdate('Y-m-d\TH:i:s.', time()) . sprintf('%03d', round(fmod(microtime(true), 1) * 1000)) . 'Z',
-                        'start_timestamp' => gmdate('Y-m-d\TH:i:s.', (int)$this->startAt) . sprintf('%03d',  round(fmod($this->startAt, 1) * 1000)) . 'Z'
-                    ]);
-                }
+                $isSuccess                = true;
             } else {
                 $parsedResponse           = json_decode($response_body, true);
 
-                // 302 redirect genellikle auth hatası
+                // 302 redirect usually indicates an auth error
                 if ($response_status == 302 || $response_status == 301) {
                     $parsedResponse = ['message' => 'Invalid API credentials', 'code' => 'CREDENTIALS', 'details' => 'Authentication failed. Check your API key and reseller ID.'];
                 }
@@ -334,9 +358,48 @@ class DNARest
                 $errorMessage             = $parsedResponse['message'] ?? ($parsedResponse['error']['message'] ?? $response_body);
                 $errorCode                = $parsedResponse['code'] ?? ($parsedResponse['error']['code'] ?? 'HTTP_' . $response_status);
                 $errorDetails             = $parsedResponse['details'] ?? ($parsedResponse['error']['details'] ?? $response_body);
+
+                // The REST gateway returns per-field validation errors under
+                // error.validationErrors[] as { members: ["$.path.field"], message }.
+                // Surface them to the end user instead of the generic "Validation
+                // failed. Please check the provided information." Otherwise the
+                // reseller never learns WHICH field is wrong. REST-only — the SOAP
+                // gateway does not return this shape.
+                $validationErrors = $parsedResponse['error']['validationErrors']
+                    ?? ($parsedResponse['validationErrors'] ?? null);
+                if (is_array($validationErrors) && !empty($validationErrors)) {
+                    $flattened = $this->flattenValidationErrors($validationErrors);
+                    if ($flattened !== '') {
+                        $errorDetails = $flattened;
+                    }
+                }
+
                 $this->lastParsedResponse = $this->setError($errorCode, $errorMessage, $errorDetails);
                 $error                    = new Exception($errorMessage, $response_status);
+                $isSuccess                = false;
+            }
 
+            // Smart sampling for performance metrics. Only SUCCESSFUL calls
+            // are sampled here: a failure already ships an error event (with
+            // the same operation/duration context), so emitting a perf
+            // transaction too would double the POSTs and the Sentry ingest —
+            // and would leak telemetry for ignored errors that the error
+            // channel deliberately suppresses. Slow successful calls (>1s)
+            // are always sampled, otherwise the configured random rate.
+            if ($isSuccess && method_exists($this, 'sendPerformanceMetricsToSentry')) {
+                $duration = (microtime(true) - $this->startAt) * 1000;
+                if ($duration > 1000 || (mt_rand(1, 1000) <= self::$PERFORMANCE_SAMPLE_RATE)) {
+                    $this->sendPerformanceMetricsToSentry([
+                        'operation'       => $this->lastFunction,
+                        'duration'        => floatval($duration),
+                        'success'         => true,
+                        'timestamp'       => gmdate('Y-m-d\TH:i:s.', time()) . sprintf('%03d', round(fmod(microtime(true), 1) * 1000)) . 'Z',
+                        'start_timestamp' => gmdate('Y-m-d\TH:i:s.', (int)$this->startAt) . sprintf('%03d', round(fmod($this->startAt, 1) * 1000)) . 'Z'
+                    ]);
+                }
+            }
+
+            if (!$isSuccess) {
                 $this->sendErrorToSentryAsync($error);
                 throw $error;
             }
@@ -354,16 +417,16 @@ class DNARest
         try {
             $response = $this->request('GET', 'deposit/accounts/me');
 
-            // SOAP ile aynı pattern'i kullan
+            // Use the same pattern as SOAP
             $resp = [];
 
             if (isset($response['resellerId'])) {
                 $resp['result'] = self::$RESULT_OK;
                 $resp['id']     = $response['resellerId'];
-                $resp['active'] = true; // API'den status gelmiyor, varsayılan true
+                $resp['active'] = true; // API returns no status; default to true
                 $resp['name']   = $response['resellerName'] ?? '';
 
-                // Ana para birimi USD, ikincil TRY
+                // Primary currency USD, secondary TRY
                 $resp['balance']  = (string)($response['usdBalance'] ?? 0);
                 $resp['currency'] = 'USD';
                 $resp['symbol']   = '$';
@@ -405,36 +468,44 @@ class DNARest
      */
     public function getCurrentBalance($currencyId = 'USD')
     {
+        $currencyName = strtoupper($currencyId);
+
+        // SOAP parity: TRY -> TL, map currency IDs
+        $currencyMap = [
+            'USD' => ['id' => 2, 'name' => 'USD', 'symbol' => '$'],
+            'TRY' => ['id' => 1, 'name' => 'TL',  'symbol' => 'TL'],
+            'EUR' => ['id' => 3, 'name' => 'EUR', 'symbol' => '€'],
+            'GBP' => ['id' => 4, 'name' => 'GBP', 'symbol' => '£'],
+        ];
+        $mapped = $currencyMap[$currencyName] ?? ['id' => 0, 'name' => $currencyName, 'symbol' => ''];
+
         try {
-            $response = $this->request('GET', 'deposit/accounts/me', ['currency' => strtoupper($currencyId)]);
+            $response = $this->request('GET', 'deposit/accounts/me', ['currency' => $currencyName]);
 
-            $balanceKey   = strtolower($currencyId) . 'Balance';
-            $currencyName = strtoupper($currencyId);
-
-            // SOAP uyumu: TRY → TL, currency ID'leri eşle
-            $currencyMap = [
-                'USD' => ['id' => 2, 'name' => 'USD', 'symbol' => '$'],
-                'TRY' => ['id' => 1, 'name' => 'TL',  'symbol' => 'TL'],
-                'EUR' => ['id' => 3, 'name' => 'EUR', 'symbol' => '€'],
-                'GBP' => ['id' => 4, 'name' => 'GBP', 'symbol' => '£'],
-            ];
-            $mapped = $currencyMap[$currencyName] ?? ['id' => 0, 'name' => $currencyName, 'symbol' => ''];
+            $balanceKey = strtolower($currencyId) . 'Balance';
 
             return [
                 'ErrorCode'        => 0,
                 'OperationMessage' => 'Command completed succesfully.',
                 'OperationResult'  => 'SUCCESS',
-                'Balance'          => number_format($response[$balanceKey] ?? 0, 2, '.', ''),
+                'Balance'          => number_format((float)($response[$balanceKey] ?? 0), 2, '.', ''),
                 'CurrencyId'       => $mapped['id'],
                 'CurrencyInfo'     => null,
                 'CurrencyName'     => $mapped['name'],
                 'CurrencySymbol'   => $mapped['symbol']
             ];
         } catch (Exception $e) {
+            // Keep the same envelope shape as the success path so callers can
+            // rely on a single schema (ErrorCode/OperationResult signal failure).
             return [
-                'result' => self::$RESULT_ERROR,
-                'error'  => $this->setError($this->formatErrorCode($e->getCode()) ?: 'BALANCE', $e->getMessage(),
-                    $this->lastParsedResponse['Details'] ?? ($this->lastResponse['raw_response'] ?? $e->getMessage()))
+                'ErrorCode'        => $this->formatErrorCode($e->getCode()) ?: 'BALANCE',
+                'OperationMessage' => $e->getMessage(),
+                'OperationResult'  => 'FAILED',
+                'Balance'          => '0.00',
+                'CurrencyId'       => $mapped['id'],
+                'CurrencyInfo'     => null,
+                'CurrencyName'     => $mapped['name'],
+                'CurrencySymbol'   => $mapped['symbol']
             ];
         }
     }
@@ -518,7 +589,15 @@ class DNARest
                     'Domains'    => isset($response['items']) ? array_map(function ($item) {
                         return [
                             'ID'                      => (int)($item['id'] ?? 0),
-                            'Status'                  => (string)($item['statusText'] ?? ($item['status'] ?? '')),
+                            // The listing endpoint puts the textual label in
+                            // `statusCode` and the numeric enum in `status`
+                            // (the reverse of domains/info). Prefer the label,
+                            // then legacy `statusText`, then resolve the enum.
+                            'Status'                  => (isset($item['statusCode']) && $item['statusCode'] !== '' && !is_numeric($item['statusCode']))
+                                ? (string)$item['statusCode']
+                                : (isset($item['statusText']) && $item['statusText'] !== '' && !is_numeric($item['statusText'])
+                                    ? (string)$item['statusText']
+                                    : $this->normalizeDomainStatus($item['status'] ?? '')),
                             'DomainName'              => $item['domainName'] ?? '',
                             'AuthCode'                => $item['authCode'] ?? '',
                             'LockStatus'              => !empty($item['lockStatus']) ? 'true' : 'false',
@@ -572,7 +651,7 @@ class DNARest
                     $pricing    = [];
                     $currencies = [];
 
-                    // Fiyatlar
+                    // Prices
                     if (isset($tld['prices'][0]) && is_array($tld['prices'][0])) {
                         $priceTypes = [
                             'register'  => 'registration',
@@ -586,11 +665,11 @@ class DNARest
                             if (isset($tld['prices'][0][$apiType])) {
                                 $apiValue = $tld['prices'][0][$apiType];
                                 if (is_array($apiValue) && isset($apiValue[0])) {
-                                    // Dizi ise
+                                    // If it's an array
                                     foreach ($apiValue as $priceInfo) {
                                         if (is_array($priceInfo)) {
                                             $period = (int)($priceInfo['period'] ?? 1);
-                                            if ($period < 1) $period = 1; // SOAP uyumu: period 0 → 1
+                                            if ($period < 1) $period = 1; // SOAP parity: period 0 -> 1
                                             $price                      = isset($priceInfo['price']) ? number_format((float)$priceInfo['price'],
                                                 4, '.', '') : '0.0000';
                                             $pricing[$outType][$period] = $price;
@@ -598,9 +677,9 @@ class DNARest
                                         }
                                     }
                                 } elseif (is_array($apiValue)) {
-                                    // Obje ise
+                                    // If it's an object
                                     $period = (int)($apiValue['period'] ?? 1);
-                                    if ($period < 1) $period = 1; // SOAP uyumu: period 0 → 1
+                                    if ($period < 1) $period = 1; // SOAP parity: period 0 -> 1
                                     $price                      = isset($apiValue['price']) ? number_format((float)$apiValue['price'],
                                         4, '.', '') : '0.0000';
                                     $pricing[$outType][$period] = $price;
@@ -855,7 +934,7 @@ class DNARest
     public function getContacts($domainName)
     {
         try {
-            // Domain info contacts bilgisini zaten içeriyor
+            // Domain info already includes the contacts
             $domainInfo = $this->request('GET', 'domains/info', ['DomainName' => $domainName]);
 
             // REST API contactType → SOAP key mapping
@@ -1107,14 +1186,51 @@ class DNARest
                 $payloadContacts[] = $this->parseContact($details, ucfirst(strtolower($type)));
             }
 
+            // Strip empty entries first, THEN fall back to defaults — a list
+            // like ["", ""] is non-empty but yields zero valid NS, which the
+            // gateway rejects with API_560. (Parity with DNASoap::register.)
+            if (is_array($nameServers)) {
+                $nameServers = array_values(array_filter($nameServers, function ($ns) {
+                    return is_string($ns) && strlen($ns) > 0;
+                }));
+            } else {
+                $nameServers = [];
+            }
+            if (empty($nameServers)) {
+                $nameServers = self::$DEFAULT_NAMESERVERS;
+            }
+
+            // For .tr domains the REST gateway only accepts the canonical TRABIS
+            // schema (TRABISDOMAINCATEGORY=Owner|Corporate + TRABISCITIZENID /
+            // TRABISTAXOFFICE / TRABISTAXNUMBER). Downstream modules still build the
+            // legacy SOAP-era shape (numeric or Company/Personal category, the
+            // TRABISCITIZIENID typo, and TRABISCOUNTRY*/CITY*/NAMESURNAME/ORG
+            // fields), which the gateway rejects with "Validation failed". Normalize
+            // here — REST ONLY; the SOAP gateway still accepts the legacy names.
+            if (substr(strtolower((string) $domainName), -3) === '.tr') {
+                $additionalAttributes = $this->normalizeTrAttributes((array) $additionalAttributes);
+            }
+
+            // The REST gateway types tldAttributes as a string dictionary; a
+            // non-string value (e.g. an integer 215, or a bool) makes its JSON
+            // deserializer fail with "The JSON value could not be converted".
+            // Coerce every value to string before sending.
+            $additionalAttributes = $this->stringifyAttributes((array) $additionalAttributes);
+
+            // Gateway schema uses `tldAttributes` (object/dict), not the
+            // legacy `additionalAttributes` (array). Always send as an object
+            // — `{}` when empty, not `[]` — so it matches the OpenAPI schema
+            // and the backend's own canonical example.
             $payload = [
-                'domainName'           => $domainName,
-                'period'               => $period,
-                'nameServers'          => empty($nameServers) ? self::$DEFAULT_NAMESERVERS : $nameServers,
-                'isLocked'             => $eppLock,
-                'privacyEnabled'       => $privacyLock,
-                'contacts'             => $payloadContacts,
-                'additionalAttributes' => $additionalAttributes
+                'domainName'    => $domainName,
+                'period'        => $period,
+                'nameServers'   => $nameServers,
+                'isLocked'      => $eppLock,
+                'privacyEnabled'=> $privacyLock,
+                'contacts'      => $payloadContacts,
+                'tldAttributes' => empty($additionalAttributes)
+                    ? new \stdClass()
+                    : (object) $additionalAttributes,
             ];
 
             $response = $this->request('POST', 'domains/register-with-contacts', $payload);
@@ -1130,6 +1246,202 @@ class DNARest
     }
 
     /**
+     * Coerce every tldAttributes value to a string. REST-only — the gateway
+     * deserializes tldAttributes as a string dictionary, so integers/bools
+     * otherwise throw "The JSON value could not be converted".
+     *
+     * @param array $attrs
+     * @return array
+     */
+    private function stringifyAttributes($attrs)
+    {
+        $out = [];
+        foreach ($attrs as $key => $value) {
+            if (is_bool($value)) {
+                $out[$key] = $value ? 'true' : 'false';
+            } elseif (is_null($value)) {
+                $out[$key] = '';
+            } elseif (is_scalar($value)) {
+                $out[$key] = (string) $value;
+            } else {
+                // Arrays/objects are not valid attribute values; encode defensively.
+                $out[$key] = json_encode($value);
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Normalize a contact country to the 2-character ISO code the gateway
+     * requires ("Country must be a 2-character ISO code"). Already-2-char codes
+     * are upper-cased; a few common full names are mapped; otherwise the value
+     * is returned untouched (the surfaced validation error then tells the
+     * reseller to fix it).
+     *
+     * @param string $country
+     * @return string
+     */
+    private function normalizeCountryCode($country)
+    {
+        $country = trim((string) $country);
+        if ($country === '') {
+            return '';
+        }
+        if (strlen($country) === 2) {
+            return strtoupper($country);
+        }
+
+        $map = [
+            'turkey' => 'TR', 'türkiye' => 'TR', 'turkiye' => 'TR',
+            'united states' => 'US', 'united states of america' => 'US', 'usa' => 'US',
+            'united kingdom' => 'GB', 'great britain' => 'GB', 'england' => 'GB',
+            'germany' => 'DE', 'deutschland' => 'DE', 'france' => 'FR', 'spain' => 'ES',
+            'italy' => 'IT', 'netherlands' => 'NL', 'india' => 'IN', 'china' => 'CN',
+            'russia' => 'RU', 'canada' => 'CA', 'australia' => 'AU', 'brazil' => 'BR',
+        ];
+        $key = strtolower($country);
+        return $map[$key] ?? $country;
+    }
+
+    /**
+     * Flatten the REST gateway's validation errors into an end-user friendly
+     * string so resellers see WHICH field failed, not just "Validation failed".
+     *
+     * REST-ONLY. Input shape: [ { "members": ["$.path.field", ...], "message": "..." }, ... ].
+     * Produces e.g. "Admin PostalCode, Tech PostalCode - 'PostalCode' is required".
+     *
+     * @param array $validationErrors
+     * @return string
+     */
+    private function flattenValidationErrors($validationErrors)
+    {
+        $parts = [];
+        foreach ($validationErrors as $ve) {
+            if (is_string($ve)) {
+                if (trim($ve) !== '') {
+                    $parts[] = trim($ve);
+                }
+                continue;
+            }
+            if (!is_array($ve)) {
+                continue;
+            }
+
+            $message = isset($ve['message']) ? trim((string) $ve['message']) : '';
+            $members = [];
+            if (isset($ve['members']) && is_array($ve['members'])) {
+                foreach ($ve['members'] as $member) {
+                    $label = $this->humanizeValidationMember((string) $member);
+                    if ($label !== '') {
+                        $members[] = $label;
+                    }
+                }
+            }
+
+            if (!empty($members) && $message !== '') {
+                $parts[] = implode(', ', $members) . ' - ' . $message;
+            } elseif (!empty($members)) {
+                $parts[] = implode(', ', $members);
+            } elseif ($message !== '') {
+                $parts[] = $message;
+            }
+        }
+
+        return implode(' | ', array_values(array_unique($parts)));
+    }
+
+    /**
+     * Turn a gateway validation member path into a readable field label.
+     * e.g. "$.administrativeContact.postalCode" => "Admin PostalCode",
+     *      "$.tldAttributes.TRABISCOUNTRYID"    => "TldAttributes TRABISCOUNTRYID".
+     *
+     * @param string $member
+     * @return string
+     */
+    private function humanizeValidationMember($member)
+    {
+        $member = trim((string) $member);
+        if ($member === '') {
+            return '';
+        }
+        $member = ltrim($member, '$.');               // drop JSONPath root "$."
+        $member = preg_replace('/\[\d+\]/', '', $member); // drop array indexes
+        $segments = preg_split('/[.\/]+/', $member, -1, PREG_SPLIT_NO_EMPTY);
+        if (empty($segments)) {
+            return '';
+        }
+
+        $roles = [
+            'administrativecontact' => 'Admin', 'administrative' => 'Admin',
+            'technicalcontact'      => 'Tech',  'technical'      => 'Tech',
+            'registrantcontact'     => 'Registrant', 'registrant' => 'Registrant',
+            'billingcontact'        => 'Billing', 'billing'      => 'Billing',
+        ];
+
+        $out = [];
+        foreach ($segments as $seg) {
+            $key   = strtolower($seg);
+            $out[] = $roles[$key] ?? ucfirst($seg);
+        }
+
+        return trim(implode(' ', $out));
+    }
+
+    /**
+     * Normalize legacy .tr TRABIS attributes to the REST gateway schema.
+     *
+     * REST-ONLY. The SOAP gateway still accepts the legacy/typo'd field names,
+     * so this must NOT be reused for DNASoap. Supported REST keys are exactly:
+     * TRABISDOMAINCATEGORY, TRABISCITIZENID, TRABISTAXOFFICE, TRABISTAXNUMBER.
+     *
+     * @param array $attrs
+     * @return array
+     */
+    private function normalizeTrAttributes($attrs)
+    {
+        if (!is_array($attrs) || empty($attrs)) {
+            return is_array($attrs) ? $attrs : [];
+        }
+
+        // Direct key→key map: legacy/SOAP-era name => REST /tlds schema name.
+        // Any key NOT listed here (TRABISNAMESURNAME, TRABISCOUNTRYID, TRABISCITYID,
+        // TRABISCOUNTRYNAME, TRABISCITYNAME, TRABISORGANIZATION, ...) is dropped — it
+        // is legacy data the gateway now derives from the contact record, and sending
+        // it as an unsupported attribute triggers "Validation failed".
+        $keyMap = [
+            'TRABISDOMAINCATEGORY' => 'TRABISDOMAINCATEGORY',
+            'TRABISCITIZENID'      => 'TRABISCITIZENID',
+            'TRABISCITIZIENID'     => 'TRABISCITIZENID', // long-standing typo → canonical
+            'TRABISTAXOFFICE'      => 'TRABISTAXOFFICE',
+            'TRABISTAXNUMBER'      => 'TRABISTAXNUMBER',
+        ];
+
+        $normalized = [];
+        foreach ($attrs as $key => $value) {
+            if (!isset($keyMap[$key])) {
+                continue;
+            }
+            // The canonical TRABISCITIZENID always wins over the typo'd variant.
+            if ($key === 'TRABISCITIZIENID' && array_key_exists('TRABISCITIZENID', $normalized)) {
+                continue;
+            }
+            $normalized[$keyMap[$key]] = $value;
+        }
+
+        // Value map for the TRABISDOMAINCATEGORY dropdown: 1 => Owner, 0 => Corporate.
+        if (isset($normalized['TRABISDOMAINCATEGORY'])) {
+            $cat = strtolower(trim((string) $normalized['TRABISDOMAINCATEGORY']));
+            if (in_array($cat, ['1', 'owner', 'personal', 'individual'], true)) {
+                $normalized['TRABISDOMAINCATEGORY'] = 'Owner';
+            } elseif (in_array($cat, ['0', 'corporate', 'company'], true)) {
+                $normalized['TRABISDOMAINCATEGORY'] = 'Corporate';
+            }
+        }
+
+        return $normalized;
+    }
+
+    /**
      * Modify privacy protection status
      * @param string $domainName
      * @param bool $status
@@ -1139,7 +1451,7 @@ class DNARest
     public function modifyPrivacyProtectionStatus($domainName, $status, $reason = 'Owner request')
     {
         try {
-            // Eğer reason boş ise, varsayılan değeri kullan
+            // If reason is empty, use the default value
             if (empty($reason)) {
                 $reason = self::$DEFAULT_REASON;
             }
@@ -1199,19 +1511,49 @@ class DNARest
     }
 
     /**
+     * Normalize a gateway domain status to its textual label.
+     *
+     * Accepts either the numeric DomainStatus enum (e.g. 0) or a label string
+     * (e.g. "Active"). Numeric values are resolved via DOMAIN_STATUS_MAP;
+     * unknown numerics fall through as their string form, and label strings
+     * are returned untouched. This keeps SOAP/REST parity for callers that
+     * compare against "Active".
+     *
+     * @param mixed $value
+     * @return string
+     */
+    private function normalizeDomainStatus($value): string
+    {
+        if (is_numeric($value)) {
+            return self::DOMAIN_STATUS_MAP[(int)$value] ?? (string)$value;
+        }
+        return (string)$value;
+    }
+
+    /**
      * Parse domain information from response
      * @param array $data
      * @return array
      */
     private function parseDomainInfo($data)
     {
+        // Always return a 'result'-keyed array. An empty/null gateway body
+        // (common during 5xx/timeout storms) otherwise returned a bare []
+        // and every consumer reading $result['result'] hit
+        // "Undefined array key 'result'".
         if (empty($data)) {
-            return [];
+            return [
+                'result' => self::$RESULT_ERROR,
+                'error'  => $this->setError('RESPONSE'),
+            ];
         }
         return [
             'data'   => [
                 'ID'                      => (int)($data['id'] ?? 0),
-                'Status'                  => (string)($data['status'] ?? ''),
+                // domains/info delivers the label in `status` (statusCode here
+                // carries the EPP code, not the lifecycle status). Normalize so
+                // a future switch to the numeric enum keeps working.
+                'Status'                  => $this->normalizeDomainStatus($data['status'] ?? ''),
                 'DomainName'              => (string)($data['domainName'] ?? ($data['name'] ?? '')),
                 'AuthCode'                => (string)($data['authCode'] ?? ($data['eppCode'] ?? '')),
                 'LockStatus'              => !empty($data['lockStatus']) ? 'true' : 'false',
@@ -1221,13 +1563,21 @@ class DNARest
                 'Dates'                   => [
                     'Start'         => isset($data['startDate']) ? date('Y-m-d\TH:i:s', strtotime($data['startDate'])) : '',
                     'Expiration'    => isset($data['expirationDate']) ? date('Y-m-d\TH:i:s', strtotime($data['expirationDate'])) : '',
-                    'RemainingDays' => (int)($data['remainingDay'] ?? 0)
+                    // The register endpoint returns expirationDate but no
+                    // remainingDay; derive it from expirationDate so callers
+                    // still get a sane day count. getDetails (which does send
+                    // remainingDay) keeps using the server value.
+                    'RemainingDays' => isset($data['remainingDay'])
+                        ? (int)$data['remainingDay']
+                        : (isset($data['expirationDate'])
+                            ? max(0, (int)ceil((strtotime($data['expirationDate']) - time()) / 86400))
+                            : 0)
                 ],
                 'NameServers'             => isset($data['nameservers']) ? array_map('strval',
                     $data['nameservers']) : [],
                 'Additional'              => isset($data['additionalAttributes']) ? (array)$data['additionalAttributes'] : [],
                 'ChildNameServers'        => isset($data['hosts']) ? array_map(function ($ns) {
-                    // SOAP uyumu: ip string olarak dönüyor (son IP)
+                    // SOAP parity: ip returned as a string (the last IP)
                     $ips = array_map(function ($ip) {
                         return $ip['ipAddress'];
                     }, $ns['ipAddresses'] ?? []);
@@ -1311,7 +1661,7 @@ class DNARest
         $fax       = $contact['Fax'] ?? ($contact['Phone']['Fax']['Number'] ?? '');
         $faxCc     = $contact['FaxCountryCode'] ?? ($contact['Phone']['Fax']['CountryCode'] ?? '');
 
-        // Array ise string olarak al (nested format)
+        // If it's an array, take it as a string (nested format)
         if (is_array($phone)) { $phoneCc = $phone['Phone']['CountryCode'] ?? ''; $phone = $phone['Phone']['Number'] ?? ''; }
         if (is_array($fax)) { $faxCc = $fax['Fax']['CountryCode'] ?? ''; $fax = $fax['Fax']['Number'] ?? ''; }
 
@@ -1324,12 +1674,16 @@ class DNARest
             'address'          => $address,
             'city'             => $contact['City'] ?? ($contact['Address']['City'] ?? ''),
             'state'            => $contact['State'] ?? ($contact['Address']['State'] ?? ''),
-            'country'          => $contact['Country'] ?? ($contact['Address']['Country'] ?? ''),
+            'country'          => $this->normalizeCountryCode($contact['Country'] ?? ($contact['Address']['Country'] ?? '')),
             'postalCode'       => $contact['ZipCode'] ?? ($contact['Address']['ZipCode'] ?? ''),
             'phoneCountryCode' => (string)$phoneCc,
             'phone'            => (string)$phone,
             'faxCountryCode'   => (string)$faxCc,
             'fax'              => (string)$fax,
+            // Required non-nullable bool in the gateway ContactLiteDto. The
+            // backend's own example payload includes it; omitting causes
+            // ModelState validation to reject the whole registration.
+            'isHidden'         => (bool)($contact['IsHidden'] ?? false),
         ];
     }
 
@@ -1401,7 +1755,7 @@ class DNARest
      */
     public function validateContact($contact)
     {
-        // Varsayılan değerleri tanımla
+        // Define default values
         $defaults = [
             "FirstName"        => "Isimyok",
             "LastName"         => "Isimyok",
@@ -1413,14 +1767,14 @@ class DNARest
             "PhoneCountryCode" => "90"
         ];
 
-        // Eksik anahtarları varsayılan değerlerle doldur
+        // Fill missing keys with default values
         foreach ($defaults as $key => $value) {
             if (!isset($contact[$key])) {
                 $contact[$key] = $value;
             }
         }
 
-        // Boş değerleri kontrol et ve varsayılan değerlerle doldur
+        // Check empty values and fill with defaults
         if (strlen(trim($contact["FirstName"])) == 0) {
             $contact["FirstName"] = $defaults["FirstName"];
         }
@@ -1440,7 +1794,7 @@ class DNARest
             $contact["ZipCode"] = $defaults["ZipCode"];
         }
 
-        // Telefon numarası işleme
+        // Phone number processing
         $tmpPhone = isset($contact["Phone"]) ? preg_replace('/[^0-9]/', '', $contact["Phone"]) : '';
         if (strlen($tmpPhone) == 10) {
             $contact["PhoneCountryCode"] = '';

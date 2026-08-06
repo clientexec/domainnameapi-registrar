@@ -15,7 +15,7 @@
  *   - Normal username → DNASoap (SOAP API)
  *
  * @package DomainNameApi
- * @version 3.0.2
+ * @version 3.0.7
  */
 
 namespace DomainNameApi;
@@ -44,6 +44,13 @@ class DomainNameAPI_PHPLibrary
      */
     public function __construct($userName = "ownername", $password = "ownerpass", $testmode = false)
     {
+        // Credentials are frequently copy-pasted into module config fields and
+        // arrive with stray leading/trailing whitespace. Trim before anything
+        // else: it fixes the auth value AND the looksLikeUuid() routing below,
+        // which would otherwise misroute a padded UUID to the SOAP client.
+        $userName = trim((string) $userName);
+        $password = trim((string) $password);
+
         if ($this->looksLikeUuid($userName)) {
             require_once __DIR__ . '/DNARest.php';
             $this->client = new DNARest($userName, $password,$testmode);
@@ -293,4 +300,14 @@ class DomainNameAPI_PHPLibrary
 
     public function validateContact($contact) { return $this->client->validateContact($contact); }
     public function isTrTLD($domain) { return $this->client->isTrTLD($domain); }
+
+    /**
+     * Facade-level override: the trait's version of this setter, when invoked
+     * on the facade, would route through __set into a private property on the
+     * client and fail. Delegate explicitly to the underlying transport.
+     */
+    public function setErrorReportingEnabled(bool $enabled): void
+    {
+        $this->client->setErrorReportingEnabled($enabled);
+    }
 }

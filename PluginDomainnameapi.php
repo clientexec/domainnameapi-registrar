@@ -6,7 +6,7 @@ require_once 'plugins/registrars/domainnameapi/api.php';
 
 class PluginDomainnameapi extends RegistrarPlugin
 {
-    public const MODULE_VERSION='2.0.2';
+    public const MODULE_VERSION='2.0.7';
     public $features = [
         'nameSuggest' => false,
         'importDomains' => true,
@@ -102,14 +102,6 @@ class PluginDomainnameapi extends RegistrarPlugin
         $result = $this->api->CheckAvailability([$params['sld']], $tldList, '1', 'create');
         $this->logCall();
 
-        if (isset($result['result']) && $result['result'] == 'ERROR') {
-            $domains[] = [
-                'tld'    => $params['tld'],
-                'domain' => $params['sld'],
-                'status' => -2
-            ];
-            return ['result' => $domains];
-        }
 
         if (is_array($result)) {
             foreach ($result as $results) {
@@ -151,7 +143,7 @@ class PluginDomainnameapi extends RegistrarPlugin
         $userPackage = new UserPackage($params['userPackageId']);
         $orderid = $this->registerDomain($this->buildRegisterParams($userPackage, $params));
         $userPackage->setCustomField("Registrar Order Id", $userPackage->getCustomField("Registrar") . '-' . $orderid);
-        return $userPackage->getCustomField('Domain Name') . ' has been registered.';
+        return $this->user->lang('{domain} has been registered.', ['domain' => $userPackage->getCustomField('Domain Name')]);
     }
 
     /**
@@ -164,7 +156,7 @@ class PluginDomainnameapi extends RegistrarPlugin
         $userPackage = new UserPackage($params['userPackageId']);
         $orderid = $this->renewDomain($this->buildRenewParams($userPackage, $params));
         $userPackage->setCustomField("Registrar Order Id", $userPackage->getCustomField("Registrar") . '-' . $orderid);
-        return $userPackage->getCustomField('Domain Name') . ' has been renewed.';
+        return $this->user->lang('{domain} has been renewed.', ['domain' => $userPackage->getCustomField('Domain Name')]);
     }
 
     public function getTransferStatus($params)
@@ -610,7 +602,10 @@ class PluginDomainnameapi extends RegistrarPlugin
    public function getTLDsAndPrices($params)
 {
     $this->setup();
-    $tldlist = $this->api->GetTldList(1200);
+    // REST gateway caps MaxResultCount at 1000 (returns 400 ModelState
+    // for anything higher); SOAP works with 1000 too. Total catalogue is
+    // ~850 TLDs so 1000 covers everything.
+    $tldlist = $this->api->GetTldList(1000);
     $this->logCall();
 
     $tlds = [];
