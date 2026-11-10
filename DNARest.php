@@ -304,9 +304,10 @@ class DNARest
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
         curl_setopt($ch, CURLOPT_TIMEOUT, self::$DEFAULT_TIMEOUT);
 
-        //ignore ssl
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        $caPathOrFile = \Composer\CaBundle\CaBundle::getSystemCaRootBundlePath();
+        curl_setopt($ch, is_dir($caPathOrFile) ? CURLOPT_CAPATH : CURLOPT_CAINFO, $caPathOrFile);
 
 
         $headers = [
